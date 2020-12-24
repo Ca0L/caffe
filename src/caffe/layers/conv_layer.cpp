@@ -2,7 +2,144 @@
 
 #include "caffe/layers/conv_layer.hpp"
 
+template <typename Dtype>
+void kmeans_cluster(vector<int> &label, vector<Dtype> &centroid, Dtype *weight, int n_weight, vector<int> &mask, int n_cluster, int max_iter)
+{
+  Dtype max_weight = numeric_limits<Dtype>::lowest();
+  Dtype min_weight = numeric_limits<Dtype>::max();
+  for (int i = 0; i < n_weight; ++i)
+  {
+    if (mask[i])
+    {
+      if (weight[i] > max_weight)
+        max_weight = weight[i];
+      if (weight[i] < min_weight)
+        min_weight = weight[i];
+    }
+  }
+
+  // linearly initialize centroids
+  for (int i = 0; i < n_cluster; ++i)
+    centroid[i] = min_weight + (max_weight - min_weight) * i / (n_cluster - 1);
+  
+  fill(label.begin(), label.begin() + n_weight, -1);
+
+  vector<Dtype> cluster_dist(n_weight);
+  vector<Dtype> cluster_sum(n_cluster, 0);
+  vector<int> cluster_sz(n_cluster, 0);
+
+  int iter = 0;
+  double pre_dist = numeric_limits<double>::max();
+  double cur_dist = 0.0;
+
+  while (iter < max_iter)
+  {
+    if (fabs(pre_dist - cur_dist) / pre_dist < 0.01) 
+      break;
+    pre_dist = cur_dist;
+    cur_dist = 0.0;
+
+    // find closest cluster for each weight
+    for (int i = 0; i < n_weight; ++i)
+    {
+      if (mask[i])
+      {
+        Dtype dist;
+        Dtype min_dist = numeric_limits<Dtype>::max();
+        int closest = -1;
+        for (int j = 0; j < n_cluster; ++j)
+        {
+          dist = fabs(weight[i] - centroid[i]);
+          if (dist < min_dist)
+          {
+            min_dist = dist;
+            closest = j;
+          }
+        }
+        label[i] = closest;
+        cluster_dist[i] = min_dist;
+      }
+    }
+
+    // calc new dist
+    for (int i = 0; i < n_weight; ++i)
+    {
+      if (mask[i])
+        cur_dist += cluster_dist[i];
+    }
+
+    // gen new centroids
+    for (int i = 0; i < n_cluster; ++i)
+    {
+      cluster_sum[i] = 0;
+      cluster_sz[i] = 0;
+    }
+
+    for (int i = 0; i < n_weight; ++i)
+    {
+      if (mask[i])
+      {
+        cluster_sum[label[i]] += weight[i];
+        cluster_sz[label[i]] += 1;
+      }
+    }
+
+    for (int i = 0; i < n_cluster; ++i)
+    {
+      centroid[i] = cluster_sum[i] / cluster_sz[i];
+    }
+
+    ++iter;
+  }
+}
+
 namespace caffe {
+
+template <typename Dtype>
+void ConvolutionLayer<Dtype>::computeBlobMask(float ratio)
+{
+  LOG(INFO) << "conv compute blob mask" << endl;
+  int count = this->blobs_[0]->count();
+  this->mask_.resize(count);
+
+  this->indices_.resize(count);
+  this->centroids_.resize(CONV_QUNUM);
+
+  const Dtype *weight = this->blobs_[0]->cpu_data();
+  vector<Dtype> sorted_weight(count);
+
+  transform(weight, weight + count, sorted_weight.begin(), fabs);
+  sort(sorted_weight.begin(), sorted_weight.end());
+
+  int index = int(count * ratio);
+  Dtype *mu_weight = this->blobs_[0]->mutable_cpu_data();
+  int rat = 0;
+
+  if (index > 0)
+  {
+    Dtype thr = sorted_weight[index - 1];
+    LOG(INFO) << "CONV THR: " << thr << " " << ratio << endl;
+
+    for (int i = 0; i < count; ++i)
+    {
+      this->mask_[i] = (weight[i] < -thr || weight[i] >= thr ? 1 : 0);
+      mu_weight[i] *= this->mask_[i];
+      rat += (1 - this->mask_[i]);
+    }
+  }
+  else
+  {
+    for (int i = 0; i < count; ++i)
+    {
+      this->mask_[i] = (weight[i] != 0.f ? 1 : 0);
+      rat += (1 - this->mask_[i]);
+    }
+  }
+
+  LOG(INFO) << "sparsity: " << 1.f * rat / count << endl;
+  int n_centroid = CONV_QUNUM;
+  kmeans_cluster(this->indices_, this->centroids_, mu_weight, count, this->masks_, n_centroid, 1000);
+}
 
 template <typename Dtype>
 void ConvolutionLayer<Dtype>::compute_output_shape() {
@@ -24,6 +161,13 @@ void ConvolutionLayer<Dtype>::compute_output_shape() {
 template <typename Dtype>
 void ConvolutionLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
       const vector<Blob<Dtype>*>& top) {
+  Dtype *mu_weight = this->blobs_[0]->mutable_cpu_data();
+  int count = this->blobs_[0]->count();
+  for (int i = 0; i < count; ++i)
+  {
+    if (this->masks_[i])
+      mu_weight = this->centroids_[this->indices_[i]];
+  }
   const Dtype* weight = this->blobs_[0]->cpu_data();
   for (int i = 0; i < bottom.size(); ++i) {
     const Dtype* bottom_data = bottom[i]->cpu_data();
@@ -61,6 +205,26 @@ void ConvolutionLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
         if (this->param_propagate_down_[0]) {
           this->weight_cpu_gemm(bottom_data + n * this->bottom_dim_,
               top_diff + n * this->top_dim_, weight_diff);
+        }
+        Dtype *weight_diff = this->blobs_[0]->mutable_cpu_diff();
+        for (int j = 0; j < count; ++j)
+        {
+          weight_diff[j] *= this->masks_[j];
+        }
+        vector<Dtype> tmp_diff(CONV_QUNUM);
+        vector<int> freq(CONV_QUNUM);
+        for (int j = 0; j < count; ++j)
+        {
+          if (this->masks_[j])
+          {
+            tmp_diff[this->indices_[j]] += weight_diff[j];
+            freq[this->indices_[j]]++;
+          }
+        }
+        for (int j = 0; j < count; ++j)
+        {
+          if (this->masks_[j])
+            weight_diff[j] = tmp_diff[this->indices_[j]] / freq[this->indices_[j]];
         }
         // gradient w.r.t. bottom data, if necessary.
         if (propagate_down[i]) {

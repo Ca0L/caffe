@@ -29,6 +29,10 @@ class BaseConvolutionLayer : public Layer<Dtype> {
   virtual inline bool EqualNumBottomTopBlobs() const { return true; }
 
  protected:
+  virtual void computeBlobMask(float ratio)
+  {
+  }
+
   // Helper functions that abstract away the column buffer and gemm arguments.
   // The last argument in forward_cpu_gemm is so that we can skip the im2col if
   // we just called weight_cpu_gemm with the same input.

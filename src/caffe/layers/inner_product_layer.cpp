@@ -7,6 +7,52 @@
 namespace caffe {
 
 template <typename Dtype>
+void InnerProductLayer<Dtype>::computeBlobMask(float ratio)
+{
+  LOG(INFO) << "IP compute blob mask" << endl;
+  int count = this->blobs_[0]->count();
+  this->mask_.resize(count);
+
+  this->indices_.resize(count);
+  this->centroids_.resize(IP_QUNUM);
+
+  const Dtype *weight = this->blobs_[0]->cpu_data();
+  vector<Dtype> sorted_weight(count);
+
+  transform(weight, weight + count, sorted_weight.begin(), fabs);
+  sort(sorted_weight.begin(), sorted_weight.end());
+
+  int index = int(count * ratio);
+  Dtype *mu_weight = this->blobs_[0]->mutable_cpu_data();
+  int rat = 0;
+
+  if (index > 0)
+  {
+    Dtype thr = sorted_weight[index - 1];
+    LOG(INFO) << "IP THR: " << thr << " " << ratio << endl;
+
+    for (int i = 0; i < count; ++i)
+    {
+      this->mask_[i] = (weight[i] < -thr || weight[i] >= thr ? 1 : 0);
+      mu_weight[i] *= this->mask_[i];
+      rat += (1 - this->mask_[i]);
+    }
+  }
+  else
+  {
+    for (int i = 0; i < count; ++i)
+    {
+      this->mask_[i] = (weight[i] != 0.f ? 1 : 0);
+      rat += (1 - this->mask_[i]);
+    }
+  }
+
+  LOG(INFO) << "sparsity: " << 1.f * rat / count << endl;
+  int n_centroid = IP_QUNUM;
+  kmeans_cluster(this->indices_, this->centroids_, mu_weight, count, this->masks_, n_centroid, 1000);
+}
+
+template <typename Dtype>
 void InnerProductLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
       const vector<Blob<Dtype>*>& top) {
   const int num_output = this->layer_param_.inner_product_param().num_output();

@@ -293,6 +293,10 @@ class Layer {
 
 
  protected:
+  vector<int> masks_;
+  vector<int> indices_;
+  vector<Dtype> centroids_;
+
   /** The protobuf that stores the layer parameters */
   LayerParameter layer_param_;
   /** The phase: TRAIN or TEST */
@@ -400,6 +404,10 @@ class Layer {
         caffe_set(count, loss_weight, loss_multiplier);
       }
     }
+  }
+
+  virtual void computeBlobMask(float ratio)
+  {
   }
 
  private:
